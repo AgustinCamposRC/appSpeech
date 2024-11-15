@@ -2,75 +2,71 @@
 import React, { useState, useRef, useEffect } from 'react';
 import './App.css';
 import io from 'socket.io-client'
+
 function App() {
   // State variables to manage recording status and conversation messages
   const [isRecording, setIsRecording] = useState(false);
   const [messages, setMessages] = useState([]);
-  const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  let muteMic = useRef(false)
+  let audioContext = useRef(null)
   let audioChunks = [];
-  let isPlaying = false;
+  let carlSpeaking = false;
+  const isSpeaking =  useRef(false)
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
   const wsRef = useRef(null);
   const audioPlayerRef = useRef(null); 
-  const audioBufferRef = useRef([]); 
+  const NOISE_THRESHOLD = 0.1;
+  const SENSITIVITY = 1;
+  const SMOOTHING_FACTOR = 0.5;
+  const SILENCE_TIMEOUT = 800;
+  let analyser = useRef(null);
+  let silenceStartTime = useRef(null);
+  let volumeLevel = useRef(0)
+  let animationFrameId = useRef(null);
+  let receivingData = useRef(false)
 
 
-  useEffect(() => {
-    const socket = io('url', {
-      query: {
-        token: 'token'
-      }
-    });
+  /*================== Handles to Servers events ==================*/
 
-    socket.on('connect', () => {
-      console.log('Connected to backend WebSocket');
-      setMessages((prev) => [
-        ...prev,
-        { role: 'system', text: 'Connected to assistant.' },
-      ]);
-    });
+  const handleResponseAudioDelta = (data) => {
+    const { delta } = data;
+    if (delta) {
+        audioChunks.push(delta);  // Agregar el nuevo chunk a la cola
 
-    socket.on('responseMessage',  (event) => {
-      try {
-        processServerMessage(event)
-      } catch (error) {
-        console.error('Error handling incoming message:', error);
-      }
-    });
+        // Si no estamos reproduciendo y hay al menos 5 chunks, iniciar la reproducción
+        if (!carlSpeaking && audioChunks.length >= 5) {
+            console.log('starting with 5 chunks');
+            playChunks();  // Iniciar la reproducción del primer grupo de chunks
+        } else if (!carlSpeaking && audioChunks.length > 0 && !receivingData.current) {
+            // Si no se están recibiendo más datos y hay chunks restantes, iniciar reproducción con lo que hay
+            console.log('starting with remaining chunks');
+            playChunks();
+        }
+    }
+};
 
-    socket.on('disconnect', () => {
-      console.log('WebSocket connection closed');
-      setMessages((prev) => [
-        ...prev,
-        { role: 'system', text: 'Disconnected from assistant.' },
-      ]);
-    });
-   
-    wsRef.current = socket;
 
-    // Cleanup WebSocket connection on component unmount
-    return () => {
-      socket.close();
-    };
-  }, []);
 
+  const handleResponseAudioTranscriptDone = (data) => {
+    const { transcript } = data;
+    setMessages((prev) => [ ...prev, { role: 'assistant', text: transcript },]);
+  };
 
 
   const processServerMessage = (data) => {
     try {
+      console.log(data)
       switch (data.type) {
+        case 'response_done':
+          receivingData.current = false
         case 'response.audio.delta':
+          receivingData.current = true
           handleResponseAudioDelta(data);
-          break;
-        case 'response.audio.done':
-          handleResponseAudioDone(data);
           break;
         case 'response.audio_transcript.done':
           handleResponseAudioTranscriptDone(data);
           break;
-        default:
-          console.log('Unhandled event type:', data.type);
       }
     } catch (error) {
       console.error('Error parsing JSON:', error);
@@ -79,93 +75,72 @@ function App() {
 
 
 
-function playChunks() {
+  function playChunks() {
     let sampleRate = 24000; // Ajusta la tasa de muestreo a la de tu fuente de audio
-    if (audioChunks.length === 0 || isPlaying) return; // No hacer nada si ya está reproduciendo o no hay chunks
-
-    isPlaying = true; // Marcar como reproduciendo
-    const chunk = audioChunks.shift(); // Obtener el primer "chunk"
-
-    // Decodificar Base64 y convertir a ArrayBuffer
-    const byteCharacters = atob(chunk);
-    const byteNumbers = new Uint8Array(byteCharacters.length);
-    for (let i = 0; i < byteCharacters.length; i++) {
-        byteNumbers[i] = byteCharacters.charCodeAt(i);
+    if (audioChunks.length === 0 || carlSpeaking) {
+        if (audioChunks.length === 0 && !carlSpeaking) { // Check if no more chunks and carl isn't speaking
+            setTimeout(() => startRecording(), 200);
+        }
+        return; // No hacer nada si ya está reproduciendo o no hay chunks
     }
 
-    const buffer = audioContext.createBuffer(1, byteNumbers.length / 2, sampleRate);
+    // Tomar hasta 5 chunks, o todos los disponibles si hay menos
+    console.log(audioChunks.length)
+    let chunksToPlay = audioChunks.splice(0, 5);
+
+    // Combinar los chunks en un solo Uint8Array
+    let combinedLength = chunksToPlay.reduce((sum, chunk) => sum + atob(chunk).length, 0);
+    let combinedArray = new Uint8Array(combinedLength);
+    let offset = 0;
+
+    chunksToPlay.forEach(chunk => {
+        const byteCharacters = atob(chunk);
+        for (let i = 0; i < byteCharacters.length; i++) {
+            combinedArray[offset++] = byteCharacters.charCodeAt(i);
+        }
+    });
+
+    const buffer = audioContext.current.createBuffer(1, combinedArray.length / 2, sampleRate);
     const channelData = buffer.getChannelData(0);
 
     // Copiar los datos PCM16 al AudioBuffer y normalizar
-    for (let i = 0; i < byteNumbers.length; i += 2) {
-        const sample = (byteNumbers[i] | (byteNumbers[i + 1] << 8)) << 16 >> 16; // Convertir a signed 16-bit
+    for (let i = 0; i < combinedArray.length; i += 2) {
+        const sample = (combinedArray[i] | (combinedArray[i + 1] << 8)) << 16 >> 16; // Convertir a signed 16-bit
         channelData[i / 2] = sample / 32767; // Normalizar a Float32
     }
 
     // Crear el source y conectarlo al contexto de audio
-    const source = audioContext.createBufferSource();
+    const source = audioContext.current.createBufferSource();
     source.buffer = buffer;
-    source.connect(audioContext.destination);
+    source.connect(audioContext.current.destination);
 
     // Aplicar un fundido suave al inicio y al final (opcional)
-    const fadeDuration = 0.0001; // Duración del fundido en segundos
+    const fadeDuration = 0.001; // Duración del fundido en segundos
     const length = channelData.length;
     for (let i = 0; i < Math.floor(fadeDuration * sampleRate); i++) {
         channelData[i] *= i / (fadeDuration * sampleRate); // Fundido al inicio
         channelData[length - i - 1] *= i / (fadeDuration * sampleRate); // Fundido al final
     }
 
+    carlSpeaking = true; // Marcar como reproduciendo
     source.start();
 
     // Al terminar la reproducción, reproducir el siguiente "chunk" si hay más
     source.onended = function () {
-        isPlaying = false; // Marcar como no reproduciendo
-        playChunks(); // Reproducir el siguiente chunk si existe
+        carlSpeaking = false; // Marcar como no reproduciendo
+        playChunks(); // Reproducir el siguiente grupo de chunks si existe
     };
 }
 
-
-// Manejo de la respuesta con el nuevo "chunk"
-const handleResponseAudioDelta = (data) => {
-    const { delta } = data;
-    if (delta) {
-        audioChunks.push(delta);  // Agregar el nuevo chunk a la cola
-
-        // Si no estamos reproduciendo, iniciar la reproducción
-        if (!isPlaying) {
-            console.log('starting');
-            playChunks();  // Iniciar la reproducción del primer "chunk"
-        }
-    }
-};
-
- 
-const handleResponseAudioDone = (data) => {
-    console.log('Audio response completed.');
-    setMessages((prev) => [
-      ...prev,
-      { role: 'system', text: 'Audio response completed.' },
-    ]);
-
-    // Clear the audio buffer
-    audioBufferRef.current = [];
-};
-
-
-const handleResponseAudioTranscriptDone = (data) => {
-    const { transcript } = data;
-    setMessages((prev) => [
-      ...prev,
-      { role: 'assistant', text: transcript },
-    ]);
-  };
 
 
 
 
 const startRecording = async () => {
     setIsRecording(true);
+   
     audioChunksRef.current = [];
+    audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -175,11 +150,7 @@ const startRecording = async () => {
       mediaRecorder.start();
 
       mediaRecorder.onstart = () => {
-        console.log('Recording started');
-        setMessages((prev) => [
-          ...prev,
-          { role: 'system', text: 'Recording started...' },
-        ]);
+       setMessages((prev) => [...prev,{ role: 'system', text: 'Recording started...' },]);
       };
 
       mediaRecorder.ondataavailable = (event) => {
@@ -189,24 +160,62 @@ const startRecording = async () => {
       };
 
       mediaRecorder.onstop = () => {
-        console.log('Recording stopped');
-        setMessages((prev) => [
-          ...prev,
-          { role: 'system', text: 'Processing audio...' },
-        ]);
-        processAudio();
+        if(!muteMic.current){
+          setMessages((prev) => [...prev,{ role: 'system', text: 'Processing audio...' },]);
+          processAudio();
+        }
       };
 
+      /* Init context to create the voice detection funcionality */
+      let audioContext2 = new AudioContext();
+      analyser.current = audioContext2.createAnalyser();
+      const source = audioContext2.createMediaStreamSource(stream);
+      source.connect(analyser.current);
+
+      /* Call to silent detection function */
+      detectSpeech();
+
     } catch (error) {
-      console.error('Error accessing microphone:', error);
       setIsRecording(false);
-      setMessages((prev) => [
-        ...prev,
-        { role: 'system', text: 'Microphone access denied or unavailable.' },
-      ]);
+      setMessages((prev) => [ ...prev, { role: 'system', text: 'Microphone access denied or unavailable.' },]);
     }
   };
 
+
+  
+
+
+ async function detectSpeech() {
+  let stopRecord = false;
+
+  // Obtener y normalizar los datos de frecuencia.
+  const dataArray = new Uint8Array(analyser.current.frequencyBinCount);
+  analyser.current.getByteFrequencyData(dataArray);
+
+  const average = dataArray.reduce((sum, value) => sum + value, 0) / dataArray.length;
+  const normalizedVolume = average / 255;
+  const now = Date.now();
+  // Suavizado exponencial
+  volumeLevel.current = SMOOTHING_FACTOR * volumeLevel.current + (1 - SMOOTHING_FACTOR) * normalizedVolume;
+  console.log(SENSITIVITY * NOISE_THRESHOLD, volumeLevel.current)
+  // Comprobación de nivel de volumen
+  if (volumeLevel.current > SENSITIVITY*NOISE_THRESHOLD) {
+    isSpeaking.current = true;
+    silenceStartTime.current = null;
+  } else {
+    if (isSpeaking.current) {
+      if (!silenceStartTime.current) silenceStartTime.current = now;
+      if (now - silenceStartTime.current > SILENCE_TIMEOUT) {
+        isSpeaking.current = false;
+        stopRecord = true
+        
+      }
+    }
+  }
+
+  // Detener o continuar la detección
+  stopRecord ? stopRecording() : (animationFrameId.current = requestAnimationFrame(detectSpeech));
+}
   /**
    * Stops the ongoing audio recording.
    */
@@ -215,33 +224,34 @@ const startRecording = async () => {
     if (mediaRecorderRef.current) {
       mediaRecorderRef.current.stop();
     }
+    if(animationFrameId.current){
+      cancelAnimationFrame(animationFrameId.current)
+    }
+    
   };
 
   /**
    * Processes the recorded audio, encodes it to PCM16 mono 24kHz, and sends it to the backend server.
    */
   const processAudio = async () => {
-    const blob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
 
-    // Process the audio to PCM16 mono 24kHz using AudioContext
-    const processedBase64Audio = await convertBlobToPCM16Mono24kHz(blob);
-
-    if (!processedBase64Audio) {
-      console.error('Audio processing failed.');
-      setMessages((prev) => [
-        ...prev,
-        { role: 'system', text: 'Failed to process audio.' },
-      ]);
-      return;
-    }
-
-    // Send the audio event to the backend via WebSocket
-   
+    try {
+      const blob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
+      if (blob.size == 0) throw 'No audio'
+      const processedBase64Audio = await convertBlobToPCM16Mono24kHz(blob);
+  
+      if (!processedBase64Audio) {
+        setMessages((prev) => [ ...prev, { role: 'system', text: 'Failed to process audio.' }]);
+        return;
+      }
+  
       wsRef.current.emit('sendMessage',{"audio": processedBase64Audio});
-      setMessages((prev) => [
-        ...prev,
-        { role: 'system', text: 'Audio sent to assistant for processing.' },
-      ]);
+      setMessages((prev) => [ ...prev, { role: 'system', text: 'Audio sent to assistant for processing.' }]);
+
+    } catch (error) {
+      stopRecording()
+      startRecording()
+    }
    
   };
 
@@ -251,6 +261,7 @@ const startRecording = async () => {
   const convertBlobToPCM16Mono24kHz = async (blob) => {
     try {
       // Initialize AudioContext with target sample rate
+      console.log(blob)
       const audioCtx = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: 24000, // Target sample rate
       });
@@ -317,10 +328,53 @@ const startRecording = async () => {
     return btoa(binary);
   };
 
+  const muteMicrophone = () => {
+    muteMic.current = true
+    stopRecording()
+  }
+
+  const unmuteMicrophone = () => {
+    muteMic.current = false
+    startRecording()
+  }
+
+
+  const connect_to_server = () =>{
+  
+    const socket = io('url', {
+      query: {
+        token: 'token'
+      },
+      transports: ['websocket'],
+      reconnection: false, 
+    });
+
+    socket.on('connect', () => {
+      console.log('Connected to backend WebSocket');
+      setMessages((prev) => [...prev,{ role: 'system', text: 'Connected to assistant.' },]);
+
+    });
+
+    socket.on('responseMessage',  (event) => {
+      try {
+        processServerMessage(event)
+      } catch (error) {
+        console.error('Error handling incoming message:', error);
+      }
+    });
+
+    socket.on('disconnect', () => {
+      setMessages((prev) => [...prev,{ role: 'system', text: 'Disconnected from assistant.' },]);
+    });
+   
+    wsRef.current = socket;
+  }
+
   return (
     <div className="App">
       <h1>OpenAI Realtime API Demo</h1>
-      <button onClick={isRecording ? stopRecording : startRecording}>
+      <button onClick={connect_to_server}>Connect Server</button>
+      <button onClick={isRecording ? muteMicrophone : unmuteMicrophone}>
         {isRecording ? 'Stop Recording' : 'Start Recording'}
       </button>
 
